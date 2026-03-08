@@ -2,13 +2,14 @@ import multiprocessing as mp
 mp.set_start_method("spawn", force=True)
 
 import os
-from tqdm import tqdm
-from dataclasses import asdict
-from PIL import Image
-from transformers import AutoProcessor
 import argparse
-import torch
+import math
 from conv_for_infer import generate_conv
+from inference_runtime import (
+    batched,
+    build_worker_assignments,
+    configure_single_gpu_process,
+)
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
 
@@ -18,6 +19,10 @@ def parse_args():
     parser.add_argument("--processor_dir", type=str, required=True)
     parser.add_argument("--input_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--max_model_len", type=int, default=32768)
+    parser.add_argument("--max_num_seqs", type=int, default=8)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     return parser.parse_args()
 
 
@@ -29,12 +34,6 @@ def collect_images(input_dir):
                 images.append(os.path.join(root, name))
     return images
 
-
-def split_list(data, n):
-    """均匀切分 list 到 n 份"""
-    return [data[i::n] for i in range(n)]
-
-
 def worker(
     rank,
     gpu_id,
@@ -42,10 +41,17 @@ def worker(
     model_dir,
     processor_dir,
     output_dir,
+    batch_size,
+    max_model_len,
+    max_num_seqs,
+    gpu_memory_utilization,
 ):
-    # ⚠️ 必须在 import vllm 之前设置
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    configure_single_gpu_process(gpu_id)
 
+    from dataclasses import asdict
+    from PIL import Image
+    from tqdm import tqdm
+    from transformers import AutoProcessor
     from vllm import LLM, EngineArgs, SamplingParams
 
     print(f"[Worker {rank}] Using GPU {gpu_id}, images: {len(image_paths)}")
@@ -54,9 +60,10 @@ def worker(
 
     engine_args = EngineArgs(
         model=model_dir,
-        max_model_len=32768,
-        max_num_seqs=5,
-        limit_mm_per_prompt={"image": 50},
+        max_model_len=max_model_len,
+        max_num_seqs=max(batch_size, max_num_seqs),
+        limit_mm_per_prompt={"image": 1},
+        gpu_memory_utilization=gpu_memory_utilization,
     )
     engine_args = asdict(engine_args) | {"seed": 0}
 
@@ -67,37 +74,45 @@ def worker(
         max_tokens=8192,
     )
 
-    for image_path in tqdm(image_paths, desc=f"GPU {gpu_id}"):
-        basename = os.path.splitext(os.path.basename(image_path))[0]
-        markdown_file = os.path.join(output_dir, f"{basename}.md")
+    num_batches = math.ceil(len(image_paths) / batch_size)
+    for image_batch in tqdm(batched(image_paths, batch_size), total=num_batches, desc=f"GPU {gpu_id}"):
+        requests = []
+        basenames = []
 
-        data_dict = {
-            "image_path": image_path
-        }
-        messages = generate_conv(data_dict)
+        for image_path in image_batch:
+            basename = os.path.splitext(os.path.basename(image_path))[0]
+            basenames.append(basename)
+            data_dict = {
+                "image_path": image_path
+            }
+            messages = generate_conv(data_dict)
+            prompt = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
 
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+            with Image.open(image_path) as image:
+                requests.append(
+                    {
+                        "prompt": prompt,
+                        "multi_modal_data": {"image": [image.copy()]},
+                    }
+                )
 
-        outputs = llm.generate(
-            {
-                "prompt": inputs,
-                "multi_modal_data": {"image": [Image.open(image_path)]}
-            },
-            sampling_params=sampling_params
-        )
+        outputs = llm.generate(requests, sampling_params=sampling_params)
 
-        text = outputs[0].outputs[0].text
-
-        with open(markdown_file, "w", encoding="utf-8") as f:
-            f.write(text)
+        for basename, output in zip(basenames, outputs):
+            markdown_file = os.path.join(output_dir, f"{basename}.md")
+            text = output.outputs[0].text
+            with open(markdown_file, "w", encoding="utf-8") as f:
+                f.write(text)
 
 
 def main():
     args = parse_args()
+
+    import torch
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -109,10 +124,10 @@ def main():
 
     print(f"Detected {num_gpus} GPUs, total images: {len(image_paths)}")
 
-    chunks = split_list(image_paths, num_gpus)
+    assignments = build_worker_assignments(image_paths, num_gpus)
 
     processes = []
-    for rank, (gpu_id, chunk) in enumerate(zip(range(num_gpus), chunks)):
+    for rank, (gpu_id, chunk) in enumerate(assignments):
         p = mp.Process(
             target=worker,
             args=(
@@ -122,6 +137,10 @@ def main():
                 args.model_dir,
                 args.processor_dir,
                 args.output_dir,
+                args.batch_size,
+                args.max_model_len,
+                args.max_num_seqs,
+                args.gpu_memory_utilization,
             )
         )
         p.start()

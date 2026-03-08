@@ -2,15 +2,13 @@ import multiprocessing as mp
 mp.set_start_method("spawn", force=True)
 
 import os
-from tqdm import tqdm
-from dataclasses import asdict
-from PIL import Image
-from transformers import AutoProcessor
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers import AutoModel, Qwen3VLForConditionalGeneration
 import argparse
-import torch
 from conv_for_infer import generate_conv
+from inference_runtime import (
+    build_worker_assignments,
+    configure_single_gpu_process,
+    get_hf_model_load_kwargs,
+)
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
 
@@ -31,12 +29,6 @@ def collect_images(input_dir):
                 images.append(os.path.join(root, name))
     return images
 
-
-def split_list(data, n):
-    """均匀切分 list 到 n 份"""
-    return [data[i::n] for i in range(n)]
-
-
 def worker(
     rank,
     gpu_id,
@@ -45,20 +37,21 @@ def worker(
     processor_dir,
     output_dir,
 ):
-    # ⚠️ 必须在 import vllm 之前设置
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    configure_single_gpu_process(gpu_id)
 
-    # from vllm import LLM, EngineArgs, SamplingParams
+    import torch
+    from tqdm import tqdm
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     print(f"[Worker {rank}] Using GPU {gpu_id}, images: {len(image_paths)}")
 
+    torch.cuda.set_device(0)
     processor = AutoProcessor.from_pretrained(processor_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_dir,
-        torch_dtype="auto",
-        device_map="auto"
+        **get_hf_model_load_kwargs(),
     )
+    model.eval()
 
     for image_path in tqdm(image_paths, desc=f"GPU {gpu_id}"):
         basename = os.path.splitext(os.path.basename(image_path))[0]
@@ -77,7 +70,8 @@ def worker(
             return_tensors="pt"
         ).to(model.device)
 
-        outputs = model.generate(**inputs, max_new_tokens=1024)
+        with torch.inference_mode():
+            outputs = model.generate(**inputs, max_new_tokens=1024)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, outputs)
         ]
@@ -87,11 +81,12 @@ def worker(
 
         with open(markdown_file, "w", encoding="utf-8") as f:
             f.write(text)
-        return text
 
 
 def main():
     args = parse_args()
+
+    import torch
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -103,10 +98,10 @@ def main():
 
     print(f"Detected {num_gpus} GPUs, total images: {len(image_paths)}")
 
-    chunks = split_list(image_paths, num_gpus)
+    assignments = build_worker_assignments(image_paths, num_gpus)
 
     processes = []
-    for rank, (gpu_id, chunk) in enumerate(zip(range(num_gpus), chunks)):
+    for rank, (gpu_id, chunk) in enumerate(assignments):
         p = mp.Process(
             target=worker,
             args=(
