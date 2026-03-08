@@ -150,7 +150,7 @@ For RTX 3090 deployments, the fastest path is the vLLM worker architecture in `q
 - Each worker is pinned to exactly one visible GPU before CUDA libraries are imported.
 - Empty GPU shards are skipped, so small jobs do not waste time loading idle model replicas.
 - vLLM requests are issued in micro-batches (`--batch_size`, default `4`) instead of one image at a time.
-- The runtime now declares `limit_mm_per_prompt={"image": 1}` because FireRed-OCR inference is single-image per request; this removes an unnecessary multimodal scheduling bottleneck on 24 GB cards such as the RTX 3090.
+- The runtime now declares `limit_mm_per_prompt={"image": 1}` because FireRed-OCR inference is single-image per request; this removes an unnecessary multimodal scheduling bottleneck on 24GB cards such as the RTX 3090.
 
 Example:
 

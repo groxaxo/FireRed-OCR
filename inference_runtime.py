@@ -32,3 +32,8 @@ def get_hf_model_load_kwargs():
         "torch_dtype": "auto",
         "device_map": {"": "cuda:0"},
     }
+
+
+def generate_with_inference_mode(torch_module, model, *, max_new_tokens, **inputs):
+    with torch_module.inference_mode():
+        return model.generate(**inputs, max_new_tokens=max_new_tokens)

@@ -7,6 +7,7 @@ from conv_for_infer import generate_conv
 from inference_runtime import (
     build_worker_assignments,
     configure_single_gpu_process,
+    generate_with_inference_mode,
     get_hf_model_load_kwargs,
 )
 
@@ -45,7 +46,6 @@ def worker(
 
     print(f"[Worker {rank}] Using GPU {gpu_id}, images: {len(image_paths)}")
 
-    torch.cuda.set_device(0)
     processor = AutoProcessor.from_pretrained(processor_dir)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_dir,
@@ -70,8 +70,12 @@ def worker(
             return_tensors="pt"
         ).to(model.device)
 
-        with torch.inference_mode():
-            outputs = model.generate(**inputs, max_new_tokens=1024)
+        outputs = generate_with_inference_mode(
+            torch,
+            model,
+            max_new_tokens=1024,
+            **inputs,
+        )
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, outputs)
         ]

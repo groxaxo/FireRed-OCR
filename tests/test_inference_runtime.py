@@ -5,6 +5,7 @@ from inference_runtime import (
     batched,
     build_worker_assignments,
     configure_single_gpu_process,
+    generate_with_inference_mode,
     get_hf_model_load_kwargs,
     split_list,
 )
@@ -42,6 +43,44 @@ class InferenceRuntimeTests(unittest.TestCase):
         self.assertEqual(
             get_hf_model_load_kwargs(),
             {"torch_dtype": "auto", "device_map": {"": "cuda:0"}},
+        )
+
+    def test_generate_with_inference_mode_wraps_model_generate(self):
+        calls = []
+
+        class FakeInferenceMode:
+            def __enter__(self):
+                calls.append("enter")
+
+            def __exit__(self, exc_type, exc, tb):
+                calls.append("exit")
+
+        class FakeTorch:
+            @staticmethod
+            def inference_mode():
+                return FakeInferenceMode()
+
+        class FakeModel:
+            @staticmethod
+            def generate(**kwargs):
+                calls.append(("generate", kwargs))
+                return "ok"
+
+        result = generate_with_inference_mode(
+            FakeTorch(),
+            FakeModel(),
+            max_new_tokens=128,
+            input_ids=[1, 2, 3],
+        )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(
+            calls,
+            [
+                "enter",
+                ("generate", {"input_ids": [1, 2, 3], "max_new_tokens": 128}),
+                "exit",
+            ],
         )
 
 

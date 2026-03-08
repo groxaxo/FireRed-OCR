@@ -19,9 +19,14 @@ def parse_args():
     parser.add_argument("--processor_dir", type=str, required=True)
     parser.add_argument("--input_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of single-image requests to submit together")
     parser.add_argument("--max_model_len", type=int, default=32768)
-    parser.add_argument("--max_num_seqs", type=int, default=8)
+    parser.add_argument(
+        "--max_num_seqs",
+        type=int,
+        default=8,
+        help="vLLM scheduler capacity; it should be at least as large as --batch_size",
+    )
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     return parser.parse_args()
 
@@ -61,7 +66,10 @@ def worker(
     engine_args = EngineArgs(
         model=model_dir,
         max_model_len=max_model_len,
+        # vLLM cannot schedule more concurrent requests than max_num_seqs.
+        # Keeping it at least as large as batch_size preserves the intended micro-batch width.
         max_num_seqs=max(batch_size, max_num_seqs),
+        # FireRed-OCR sends exactly one image per prompt, so reserving capacity for more only hurts throughput.
         limit_mm_per_prompt={"image": 1},
         gpu_memory_utilization=gpu_memory_utilization,
     )
@@ -78,35 +86,41 @@ def worker(
     for image_batch in tqdm(batched(image_paths, batch_size), total=num_batches, desc=f"GPU {gpu_id}"):
         requests = []
         basenames = []
+        opened_images = []
 
-        for image_path in image_batch:
-            basename = os.path.splitext(os.path.basename(image_path))[0]
-            basenames.append(basename)
-            data_dict = {
-                "image_path": image_path
-            }
-            messages = generate_conv(data_dict)
-            prompt = processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
+        try:
+            for image_path in image_batch:
+                basename = os.path.splitext(os.path.basename(image_path))[0]
+                basenames.append(basename)
+                data_dict = {
+                    "image_path": image_path
+                }
+                messages = generate_conv(data_dict)
+                prompt = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
 
-            with Image.open(image_path) as image:
+                image = Image.open(image_path)
+                opened_images.append(image)
                 requests.append(
                     {
                         "prompt": prompt,
-                        "multi_modal_data": {"image": [image.copy()]},
+                        "multi_modal_data": {"image": [image]},
                     }
                 )
 
-        outputs = llm.generate(requests, sampling_params=sampling_params)
+            outputs = llm.generate(requests, sampling_params=sampling_params)
 
-        for basename, output in zip(basenames, outputs):
-            markdown_file = os.path.join(output_dir, f"{basename}.md")
-            text = output.outputs[0].text
-            with open(markdown_file, "w", encoding="utf-8") as f:
-                f.write(text)
+            for basename, output in zip(basenames, outputs):
+                markdown_file = os.path.join(output_dir, f"{basename}.md")
+                text = output.outputs[0].text
+                with open(markdown_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+        finally:
+            for image in opened_images:
+                image.close()
 
 
 def main():
