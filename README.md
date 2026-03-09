@@ -91,6 +91,7 @@ FireRed-OCR is based on the Qwen3-VL architecture. You can use the following cod
 ```bash
 pip install transformers
 pip install qwen-vl-utils
+pip install vllm  # Recommended for higher throughput on RTX 3090-class GPUs
 git clone https://github.com/FireRedTeam/FireRed-OCR.git
 cd FireRed-OCR
 ```
@@ -104,7 +105,7 @@ from conv_for_infer import generate_conv
 model = Qwen3VLForConditionalGeneration.from_pretrained(
     "FireRedTeam/FireRed-OCR",
     torch_dtype=torch.bfloat16,
-    device_map="auto",
+    device_map={"": "cuda:0"},
 )
 
 # We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
@@ -112,7 +113,7 @@ model = Qwen3VLForConditionalGeneration.from_pretrained(
 #     "Qwen/FireRed-OCR,
 #     dtype=torch.bfloat16,
 #     attn_implementation="flash_attention_2",
-#     device_map="auto",
+#     device_map={"": "cuda:0"},
 # )
 
 processor = AutoProcessor.from_pretrained("FireRedTeam/FireRed-OCR")
@@ -141,6 +142,30 @@ output_text = processor.batch_decode(
 )
 print(output_text)
 ```
+
+### RTX 3090 Throughput Path
+
+For RTX 3090 deployments, the fastest path is the vLLM worker architecture in `qwen3_vllm_infer.py`.
+
+- Each worker is pinned to exactly one visible GPU before CUDA libraries are imported.
+- Empty GPU shards are skipped, so small jobs do not waste time loading idle model replicas.
+- vLLM requests are issued in micro-batches (`--batch_size`, default `4`) instead of one image at a time.
+- The runtime now declares `limit_mm_per_prompt={"image": 1}` because FireRed-OCR inference is single-image per request; this removes an unnecessary multimodal scheduling bottleneck on 24GB cards such as the RTX 3090.
+
+Example:
+
+```bash
+python qwen3_vllm_infer.py \
+  --model_dir /workspace/FireRed-OCR \
+  --processor_dir /workspace/FireRed-OCR \
+  --input_dir /workspace/cropped \
+  --output_dir /workspace/outputs \
+  --batch_size 4 \
+  --max_num_seqs 8 \
+  --gpu_memory_utilization 0.9
+```
+
+If you need the Hugging Face backend instead, `qwen3_hf_infer.py` now follows the same one-worker-per-GPU architecture so that `device_map` no longer spills a single worker across every visible device.
 
 ## 📊 Benchmark
 
